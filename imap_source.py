@@ -81,14 +81,17 @@ class Mailbox:
             pass
 
     def alert_emails(self, hours):
-        """LinkedIn emails whose Date header is within the last `hours` hours.
+        """Job-alert emails whose Date header is within the last `hours` hours.
 
+        Only mail from IMAP_ALERT_FROM (default jobalerts-noreply@linkedin.com), so LinkedIn's
+        security / verification mail and anything forwarded by hand are not read.
         IMAP SINCE is day-granular, so search a day wider and filter on the header.
         Uses BODY.PEEK so reading never sets \\Seen.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
         since = (cutoff - timedelta(days=1)).strftime("%d-%b-%Y")
-        typ, data = self.conn.uid("SEARCH", None, "SINCE", since, "FROM", '"linkedin.com"')
+        sender = os.environ.get("IMAP_ALERT_FROM", "jobalerts-noreply@linkedin.com")
+        typ, data = self.conn.uid("SEARCH", None, "SINCE", since, "FROM", f'"{sender}"')
         if typ != "OK":
             raise RuntimeError(f"IMAP search failed: {data}")
         out = []

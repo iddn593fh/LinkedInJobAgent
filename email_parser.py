@@ -10,6 +10,9 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 
 JOB_ID_RE = re.compile(r"/jobs/view/(?:[^/?#&\s]*?-)?(\d{6,})")
 SEE_ALL_RE = re.compile(r"\b(?:see|view)\s+all\s+([\d,]+)\+?\s+(?:new\s+)?jobs?\b", re.I)
+# Current template: header "30+ new jobs in United States match your preferences.",
+# footer just "See all jobs" with no number.
+NEW_JOBS_RE = re.compile(r"\b([\d,]+)\+?\s+new\s+jobs?\b", re.I)
 SEPARATOR_RE = re.compile(r"\s+[·•|]\s+")
 
 GENERIC_ANCHOR = re.compile(
@@ -176,5 +179,6 @@ def parse_alert_html(html):
         })
 
     text = soup.get_text(" ", strip=True)
-    counts = [int(m.group(1).replace(",", "")) for m in SEE_ALL_RE.finditer(text)]
+    counts = [int(m.group(1).replace(",", ""))
+              for rx in (SEE_ALL_RE, NEW_JOBS_RE) for m in rx.finditer(text)]
     return {"cards": cards, "see_all": max(counts) if counts else None}

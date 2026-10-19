@@ -6,7 +6,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import db
-from filters import fingerprint
+from parsing import fingerprint
 
 
 def job(job_id, title, company="Acme", location="San Francisco, CA"):
@@ -63,20 +63,52 @@ class DbTest(unittest.TestCase):
         self.assertEqual(db.mark_notified(self.conn, ["4000000001"]), 1)
         self.assertEqual(db.mark_notified(self.conn, ["4000000001"]), 0)
 
-    def test_verdict_cache_shared_across_reposts(self):
+    def test_repost_inherits_triage_and_verdict(self):
         a = job("4000000001", "Application Security Engineer")
-        b = job("4000000999", "Application Security Engineer III")
         db.upsert_seen(self.conn, a)
+        db.save_triage(self.conn, a["fingerprint"], "yes")
+        db.save_verdict(self.conn, a["fingerprint"], {"verdict": "reject", "reason": "SOC tooling"})
+        b = job("4000000999", "Application Security Engineer III")       # reposted later
         db.upsert_seen(self.conn, b)
-        db.save_verdict(self.conn, "4000000001", {"verdict": "reject", "reason": "SOC tooling"})
-        self.assertEqual(db.get_cached_verdict(self.conn, b["fingerprint"])["verdict"], "reject")
+        got = db.get_job(self.conn, "4000000999")
+        self.assertEqual((got["triage"], got["verdict"]["verdict"]), ("yes", "reject"))
+        self.assertEqual(db.pending_triage(self.conn, 3), [])
+        self.assertEqual(db.pending_judge(self.conn, 3, 30), [])
+
+    def test_queues(self):
+        a, b, c = (job("1", "AppSec Engineer", company="A"), job("2", "Red Team", company="B"),
+                   job("3", "Pentester", company="C"))
+        for j in (a, b, c):
+            db.upsert_seen(self.conn, j)
+        self.assertEqual(len(db.pending_triage(self.conn, 3)), 3)
+        db.save_triage(self.conn, a["fingerprint"], "maybe")
+        db.save_triage(self.conn, b["fingerprint"], "yes")
+        db.save_triage(self.conn, c["fingerprint"], "no")
+        self.assertEqual([j["job_id"] for j in db.pending_enrich(self.conn, 3)], ["2", "1"])  # yes first
+        self.assertEqual(db.pending_judge(self.conn, 3, 30), [])     # waiting for enrichment
+        db.save_enrichment(self.conn, "2", {"description": "d", "seniority_level": None, "yoe_min": 3,
+                                            "salary_min": None, "salary_max": None})
+        db.save_enrichment(self.conn, "1", None)                      # posting gone: judge on card
+        self.assertEqual([j["job_id"] for j in db.pending_judge(self.conn, 3, 30)], ["2", "1"])
+        self.assertEqual(db.count_pending(self.conn, 3), 2)
+        db.save_verdict(self.conn, b["fingerprint"], {"verdict": "send"})
+        db.save_verdict(self.conn, a["fingerprint"], {"verdict": "reject"})
+        self.assertEqual([j["job_id"] for j in db.to_send(self.conn)], ["2"])
+        db.mark_notified(self.conn, ["2"])
+        self.assertEqual(db.to_send(self.conn), [])
+        self.assertEqual(db.count_pending(self.conn, 3), 0)
+
+    def test_llm_usage_accumulates(self):
+        db.add_llm_usage(self.conn, 1, 500)
+        db.add_llm_usage(self.conn, 2, 700)
+        self.assertEqual(db.llm_usage_today(self.conn), (3, 1200))
 
     def test_run_bookkeeping(self):
         rid = db.start_run(self.conn, 26)
-        db.finish_run(self.conn, rid, {"emails": 3, "cards": 20, "title_pass": 4})
+        db.finish_run(self.conn, rid, {"emails": 3, "cards": 20, "triage_pass": 4})
         db.add_to_latest_run(self.conn, "notified", 2)
         r = db.run_history(self.conn)[0]
-        self.assertEqual((r["cards"], r["title_pass"], r["notified"]), (20, 4, 2))
+        self.assertEqual((r["cards"], r["triage_pass"], r["notified"]), (20, 4, 2))
 
 
 if __name__ == "__main__":

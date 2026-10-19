@@ -1,0 +1,30 @@
+# LLM provider for the two judging stages. Any OpenAI-compatible endpoint works
+# (Groq, Gemini's OpenAI endpoint, xAI, OpenRouter): change base_url / model / limits.
+# The API key goes in .env as LLM_API_KEY, never here.
+base_url: https://api.groq.com/openai/v1
+model: openai/gpt-oss-120b
+# Reasoning model: its hidden reasoning counts toward each reply's max_tokens and the token
+# limits, so keep effort low and give every request this much headroom on top of the JSON.
+extra_body: {reasoning_effort: low}
+reasoning_tokens: 800
+
+# Your account's free-tier limits for the model above. rpd / tpm confirmed by `llm-check`
+# (x-ratelimit-* headers, 2026-10-18); tpd is not sent in headers - 200k is Groq's published
+# figure for gpt-oss-120b, check https://console.groq.com/settings/limits. If it is lower,
+# the provider's 429 stops the run and the rest carries over to the next one.
+# The daily limits reset at midnight UTC; usage is tracked in the DB across runs.
+limits:
+  rpm: 30          # requests per minute
+  rpd: 1000        # requests per day
+  tpm: 8000        # tokens per minute - also caps a single request (prompt + reply)
+  tpd: 200000     # tokens per day
+  context: 131072  # model context window
+safety: 0.8        # use at most 80% of every limit; token counts are estimates
+
+triage_batch_max: 80     # titles per stage-A request (also bounded by tpm)
+judge_batch_max: 10      # postings per stage-B request (also bounded by tpm)
+judge_desc_chars: 3500   # posting excerpt per job; the opening + experience/pay/level lines
+
+# extra_body is merged into every request. For a non-reasoning model drop it and set
+# reasoning_tokens: 0. List the models your key can use with:
+#   curl -s https://api.groq.com/openai/v1/models -H "Authorization: Bearer $LLM_API_KEY"

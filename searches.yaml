@@ -1,0 +1,23 @@
+# LinkedIn guest searches, run every day for postings from the last --hours (24).
+# Results are relevance-ranked and match loosely (quoting a phrase does not make it exact),
+# so a search almost never runs dry: --max-pages (default 5 = 50 jobs) is what ends it.
+# Override per search with `max_pages: N`.
+# Sampled 2026-10-18, "offensive security", 24h: 200+ results; title-pass per page was
+# 5,5,3,4 | 1,1,4,1,1,1 | ... - pages 1-4 held 40% of title passes and nearly every
+# genuinely offensive role; deeper pages were generic security roles other searches cover.
+# Waits: --page-delay between pages, --search-delay before each new search,
+# --max-minutes for the whole LinkedIn phase. When the budget runs out, the searches
+# at the bottom are the ones skipped, so keep the most important ones first.
+# geo_id 103644278 = United States. Use `location: "Seattle, WA"` instead for a city,
+# and `remote: true` to restrict to remote roles.
+defaults:
+  geo_id: 103644278
+searches:
+  - keywords: application security
+  - keywords: product security
+  - keywords: offensive security
+  - keywords: red team
+  - keywords: penetration testing
+  - keywords: vulnerability research
+  - keywords: security researcher
+  - keywords: security engineer
