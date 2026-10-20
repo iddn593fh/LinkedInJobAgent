@@ -8,3 +8,4 @@ samples/
 logs/
 test.db
 test.db-*
+n8n/*.workflow.json

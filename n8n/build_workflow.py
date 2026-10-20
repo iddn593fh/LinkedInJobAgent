@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Generate the n8n workflow JSON (daily + test variants) for jobagent.
 
-    python3 n8n/build_workflow.py --chat-id 123456789 --cred-id JobAgentTgCred01
+    python3 n8n/build_workflow.py            # chat ID from TELEGRAM_CHAT_ID in /opt/jobagent/.env
 
-writes n8n/jobagent.workflow.json and n8n/jobagent-test.workflow.json; import with
-    n8n import:workflow --input=n8n/jobagent.workflow.json
+writes n8n/jobagent.workflow.json and n8n/jobagent-test.workflow.json (gitignored: they contain
+your Telegram chat ID); import with
+    set -a; . /opt/n8n.env; set +a; n8n import:workflow --input=n8n/jobagent.workflow.json
 
 Flow:
   Daily 10:00 / Manual run -> Fetch jobs -> Parse -> Any matches?
@@ -20,6 +21,20 @@ import json
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+ENV_PATH = os.path.join(os.path.dirname(HERE), ".env")
+
+
+def env_value(key):
+    """KEY from the environment, else from the project's .env."""
+    if os.environ.get(key):
+        return os.environ[key]
+    if os.path.exists(ENV_PATH):
+        with open(ENV_PATH) as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k.strip() == key:
+                    return v.strip().strip('"').strip("'")
+    return None
 CLI = "cd /opt/jobagent && {env}venv/bin/python linkedin_source.py"
 
 PARSE_JS = r"""const out = $input.first().json;
@@ -123,9 +138,12 @@ def build(chat_id, cred_id, test=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--chat-id", required=True)
-    ap.add_argument("--cred-id", required=True)
+    ap.add_argument("--chat-id", default=env_value("TELEGRAM_CHAT_ID"),
+                    help="Telegram chat ID (default: TELEGRAM_CHAT_ID from .env)")
+    ap.add_argument("--cred-id", default="JobAgentTgCred01", help="n8n Telegram credential ID")
     a = ap.parse_args()
+    if not a.chat_id:
+        ap.error("no chat ID: set TELEGRAM_CHAT_ID in .env or pass --chat-id")
     for test, fname in ((False, "jobagent.workflow.json"), (True, "jobagent-test.workflow.json")):
         with open(os.path.join(HERE, fname), "w") as f:
             json.dump(build(a.chat_id, a.cred_id, test), f, indent=2)
