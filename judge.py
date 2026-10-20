@@ -68,6 +68,7 @@ Return JSON only:
 "comp_fit": "...", "comp_note": "<max 15 words>", "reason": "<one clause, max 12 words>", \
 "confidence": <0.0-1.0>, "summary": "..."}, ...]} with every id."""
 
+TRIAGE_HEADER = "id | title | company | location\n"
 TRIAGE_OUT_PER_JOB = 14
 JUDGE_OUT_PER_JOB = 190
 EXCERPT_KEYWORDS = re.compile(
@@ -138,14 +139,15 @@ def triage(client, jobs, cfg, on_result):
     """Label jobs yes/maybe/no. Calls on_result(job, label) as each batch returns; jobs the
     model leaves out of its reply default to "maybe". Stops quietly on LLMStop."""
     reasoning = int(cfg.get("reasoning_tokens", 0))
-    overhead = estimate_tokens(TRIAGE_SYSTEM) + 20 + reasoning
+    # Same fixed costs chat() will count: header line, +30 in max_tokens, reasoning headroom.
+    overhead = estimate_tokens(TRIAGE_SYSTEM) + estimate_tokens(TRIAGE_HEADER) + 30 + reasoning
     batches = pack(jobs, lambda j: estimate_tokens(_triage_line(0, j)) + 2, overhead,
                    TRIAGE_OUT_PER_JOB, client.request_max, int(cfg.get("triage_batch_max", 80)))
     done = 0
     for batch in batches:
         lines = "\n".join(_triage_line(i, j) for i, j in enumerate(batch, 1))
         try:
-            reply = client.chat(TRIAGE_SYSTEM, "id | title | company | location\n" + lines,
+            reply = client.chat(TRIAGE_SYSTEM, TRIAGE_HEADER + lines,
                                 max_tokens=TRIAGE_OUT_PER_JOB * len(batch) + 30 + reasoning)
         except LLMStop:
             break
@@ -181,7 +183,9 @@ def judge(client, jobs, cfg, on_result):
         return 0
     desc_chars = int(cfg.get("judge_desc_chars", 3500))
     reasoning = int(cfg.get("reasoning_tokens", 0))
-    overhead = estimate_tokens(JUDGE_SYSTEM) + 20 + reasoning
+    # Same fixed costs chat() will count: +60 in max_tokens, reasoning headroom, and slack for
+    # the newlines joining the job blocks.
+    overhead = estimate_tokens(JUDGE_SYSTEM) + 60 + 20 + reasoning
     # One job must always fit in a request: shrink the excerpt if the per-request cap is tight.
     room = client.request_max - overhead - JUDGE_OUT_PER_JOB - 150
     # And all of today's jobs should fit in what is left of the daily token budget: spread it,

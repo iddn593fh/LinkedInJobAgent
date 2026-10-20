@@ -128,6 +128,27 @@ class ClientTest(unittest.TestCase):
         self.assertTrue(slept and slept[0] >= 59)
 
 
+    def test_lone_request_over_minute_budget_does_not_crash(self):
+        # Regression, 2026-10-20 daily run: empty window + estimate above tpm -> IndexError.
+        p = FakeProvider(queue=[Resp(content="{}", tokens=3000), Resp(content='{"ok": 1}')])
+        c, slept, _ = make_client(p)
+        c.chat("s", "u", 10)
+        c.clock = lambda: 1000.0                       # previous request has left the window
+        self.assertEqual(c.chat("s", "x" * 18500, 10), {"ok": 1})   # ~6170 + 10 tokens > 6000 tpm
+
+
+class PackConsistencyTest(unittest.TestCase):
+    def test_judge_batches_never_exceed_request_cap(self):
+        cfg = {**CFG, "reasoning_tokens": 800, "limits": {**CFG["limits"], "tpm": 8000}, "safety": 0.8}
+        p = FakeProvider(handler=judge_handler)
+        c, _, _ = make_client(p, cfg=cfg)
+        jobs_ = [{**j, "description": "Responsibilities\n" + ("word " * 900)} for j in jobs(9)]
+        judge(c, jobs_, cfg, lambda j, v: None)
+        for b in p.bodies:
+            est = sum(len(m["content"]) // 3 + 1 for m in b["messages"]) + b["max_tokens"]
+            self.assertLessEqual(est, c.request_max)
+
+
 class DecideTest(unittest.TestCase):
     def test_only_definite_negatives_reject(self):
         base = {"discipline": "appsec", "seniority_fit": "good", "comp_fit": "likely_above"}

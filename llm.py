@@ -103,7 +103,10 @@ class LLMClient:
             while self.window and t - self.window[0][0] >= 60:
                 self.window.popleft()
             used = sum(n for _, n in self.window)
-            if len(self.window) < self.rpm and used + est <= self.tpm:
+            # An empty window means nothing to wait for: a lone request estimated above our
+            # (safety-scaled) per-minute budget goes as-is - the provider's real limit is higher,
+            # and waiting could never make it fit. (2026-10-20: this case crashed the daily run.)
+            if not self.window or (len(self.window) < self.rpm and used + est <= self.tpm):
                 return
             self.sleep(max(0.5, 60 - (t - self.window[0][0]) + 0.5))
 
