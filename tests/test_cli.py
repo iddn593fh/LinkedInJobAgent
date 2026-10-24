@@ -35,7 +35,8 @@ def fake_llm(user):
     out, cur = [], None
     for l in lines:
         if l.startswith("### id"):
-            cur = {"id": int(l.split()[-1]), "discipline": "appsec", "seniority_fit": "good",
+            cur = {"id": int(l.split()[-1]), "role_type": "appsec", "offensive_work": "significant",
+                   "offensive_evidence": "manual pentests of web apps", "seniority_fit": "good",
                    "comp_fit": "likely_above", "comp_note": "pays well", "reason": "appsec",
                    "confidence": 0.8, "summary": "Threat modeling and code review."}
             out.append(cur)

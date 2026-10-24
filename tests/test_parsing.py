@@ -18,10 +18,11 @@ class FingerprintTest(unittest.TestCase):
         c = fingerprint("Acme", "Product Security Engineer", "San Francisco, CA")
         self.assertNotEqual(a, c)
 
-    def test_company_and_location_matter(self):
+    def test_company_matters_location_does_not(self):
         a = fingerprint("Acme", "Application Security Engineer", "San Francisco, CA")
         self.assertNotEqual(a, fingerprint("Globex", "Application Security Engineer", "San Francisco, CA"))
-        self.assertNotEqual(a, fingerprint("Acme", "Application Security Engineer", "New York, NY"))
+        # same role in another city is the same job (one message listing both locations)
+        self.assertEqual(a, fingerprint("Acme", "Application Security Engineer", "New York, NY"))
 
     def test_punctuation_and_case_insensitive(self):
         self.assertEqual(fingerprint("Acme, Inc.", "Security Engineer - AppSec", "Remote"),

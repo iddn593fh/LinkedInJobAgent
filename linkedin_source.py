@@ -151,15 +151,19 @@ def _money(lo, hi):
     return f"${lo:,}-${hi:,}" if lo != hi else f"${hi:,}"
 
 
-def candidate(j):
-    """What n8n gets for one job: the fields, plus the ready-to-send Telegram text (HTML mode)."""
+def candidate(j, locations=None):
+    """What n8n gets for one job: the fields, plus the ready-to-send Telegram text (HTML mode).
+    `locations`: every location the role was posted in (same company + title)."""
     v = j["verdict"] or {}
+    locations = locations or [j["location"]]
     salary = _money(j.get("salary_min"), j.get("salary_max")) or j.get("salary_text")
     e = lambda x: html.escape(str(x or "?"), quote=False)
     yoe = v.get("yoe_required")
     if yoe is None:
         yoe = j.get("yoe_min")
-    lines = [f"<b>{e(j['title'])}</b>", f"{e(j['company'])} - {e(j['location'])}",
+    where = e(locations[0]) if len(locations) == 1 else f"{len(locations)} locations: " + "; ".join(
+        e(x) for x in locations)
+    lines = [f"<b>{e(j['title'])}</b>", f"{e(j['company'])} - {where}",
              f"YoE: {yoe}+ years" if yoe is not None else "YoE: not stated"]
     if salary:
         lines.append(f"Posted salary: {e(salary)}")
@@ -170,9 +174,11 @@ def candidate(j):
     lines += ["", e(j["url"])]
     return {
         "job_key": j["job_id"], "url": j["url"], "title": j["title"], "company": j["company"],
-        "location": j["location"], "salary": salary, "yoe": yoe, "yoe_min": j.get("yoe_min"),
+        "location": j["location"], "locations": locations, "salary": salary, "yoe": yoe, "yoe_min": j.get("yoe_min"),
         "seniority_level": j.get("seniority_level"), "posted": j.get("posted"),
-        "discipline": v.get("discipline"), "seniority_fit": v.get("seniority_fit"),
+        "role_type": v.get("role_type") or v.get("discipline"),
+        "offensive_work": v.get("offensive_work"), "offensive_evidence": v.get("offensive_evidence"),
+        "seniority_fit": v.get("seniority_fit"),
         "comp_fit": v.get("comp_fit"), "comp_note": v.get("comp_note"), "reason": v.get("reason"),
         "confidence": v.get("confidence"), "summary": v.get("summary"),
         "judged_on": v.get("judged_on"), "message": "\n".join(lines),
@@ -240,7 +246,9 @@ def cmd_debug(args):
             v = c.get("verdict")
             if v:
                 print(f"  [{v['verdict'].upper()}] {c['title']}  |  {c['company']}  |  {c['location']}")
-                print(f"         discipline {v.get('discipline')} | seniority {v.get('seniority_fit')}"
+                print(f"         {v.get('role_type') or v.get('discipline')} | offensive "
+                      f"{v.get('offensive_work')}: {v.get('offensive_evidence')}")
+                print(f"         seniority {v.get('seniority_fit')}"
                       f" (yoe {v.get('yoe_required')}) | pay {v.get('comp_fit')}: {v.get('comp_note')}"
                       f" | on {v.get('judged_on')}")
                 print(f"         {v.get('reason')}")
@@ -295,7 +303,8 @@ def cmd_fetch(args):
 
     stats["run_id"] = run_id
     stats["searches"] = report["searches"]
-    json.dump({"stats": stats, "candidates": [candidate(j) for j in db.to_send(conn)]},
+    json.dump({"stats": stats, "candidates": [candidate(j, db.locations(conn, j["fingerprint"]))
+                                             for j in db.to_send(conn)]},
               sys.stdout, indent=1)
     print()
 

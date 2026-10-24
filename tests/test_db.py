@@ -98,6 +98,31 @@ class DbTest(unittest.TestCase):
         self.assertEqual(db.to_send(self.conn), [])
         self.assertEqual(db.count_pending(self.conn, 3), 0)
 
+    def test_same_role_in_two_cities_is_one_job(self):
+        sf, ny = job("1", "Security Engineer, Offensive Security"), job("2", "Security Engineer, Offensive Security", location="New York, NY")
+        self.assertEqual(sf["fingerprint"], ny["fingerprint"])
+        for j in (sf, ny):
+            db.upsert_seen(self.conn, j)
+        self.assertEqual(len(db.pending_triage(self.conn, 3)), 1)          # judged once
+        db.save_triage(self.conn, sf["fingerprint"], "yes")
+        db.save_verdict(self.conn, sf["fingerprint"], {"verdict": "send"})
+        sends = db.to_send(self.conn)
+        self.assertEqual(len(sends), 1)                                    # one message
+        self.assertEqual(db.locations(self.conn, sends[0]["fingerprint"]), ["San Francisco, CA", "New York, NY"])
+        db.mark_notified(self.conn, [sends[0]["job_id"]])
+        self.assertTrue(db.is_notified(self.conn, "3", fingerprint("Acme", "Security Engineer, Offensive Security", "Austin, TX")))
+
+    def test_migration_recomputes_old_location_fingerprints(self):
+        path = os.path.join(self.tmp.name, "old.db")
+        conn = db.connect(path)
+        conn.execute("PRAGMA user_version = 0")
+        db.upsert_seen(conn, {**job("1", "AppSec Engineer"), "fingerprint": "old-with-location"})
+        conn.close()
+        conn = db.connect(path)                                            # migrates
+        self.assertEqual(db.get_job(conn, "1")["fingerprint"], fingerprint("Acme", "AppSec Engineer"))
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+        conn.close()
+
     def test_llm_usage_accumulates(self):
         db.add_llm_usage(self.conn, 1, 500)
         db.add_llm_usage(self.conn, 2, 700)

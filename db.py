@@ -9,7 +9,7 @@ DEFAULT_DB = "/opt/jobagent/jobagent.db"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     job_id        TEXT PRIMARY KEY,          -- LinkedIn numeric job ID; this is the job_key
-    fingerprint   TEXT NOT NULL,             -- sha256(company|normalized_title|location)
+    fingerprint   TEXT NOT NULL,             -- sha256(company|normalized_title), see parsing.py
     title         TEXT,
     company       TEXT,
     location      TEXT,
@@ -107,7 +107,27 @@ def connect(path=None, readonly=False):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+SCHEMA_VERSION = 1
+
+
+def _migrate(conn):
+    """One-off data migrations, tracked in PRAGMA user_version.
+
+    v1 (2026-10-24): fingerprints no longer include location. Recompute every row so jobs
+    already sent in one city dedupe against the same role posted elsewhere."""
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version < 1:
+        from parsing import fingerprint
+        rows = conn.execute("SELECT job_id, company, title FROM jobs").fetchall()
+        conn.executemany("UPDATE jobs SET fingerprint = ? WHERE job_id = ?",
+                         [(fingerprint(r["company"], r["title"]), r["job_id"]) for r in rows])
+    if version < SCHEMA_VERSION:
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        conn.commit()
 
 
 # --- dedup -----------------------------------------------------------------
@@ -252,6 +272,14 @@ def to_send(conn):
                            AND s.notified_at IS NOT NULL)
            ORDER BY first_seen_at""").fetchall()
     return _one_per_fingerprint(rows)    # one message per job
+
+
+def locations(conn, fingerprint):
+    """Every location this role has been seen in (one message lists them all)."""
+    rows = conn.execute(
+        "SELECT DISTINCT location FROM jobs WHERE fingerprint = ? AND location IS NOT NULL "
+        "ORDER BY first_seen_at", (fingerprint,)).fetchall()
+    return [r[0] for r in rows]
 
 
 def save_triage(conn, fingerprint, label):

@@ -6,7 +6,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from judge import decide, excerpt, judge, triage
-from llm import LLMClient, LLMStop, pack, parse_json
+from llm import LLMBadOutput, LLMClient, LLMStop, pack, parse_json
 
 CFG = {"base_url": "https://llm.test/v1", "model": "m", "safety": 1.0,
        "limits": {"rpm": 30, "rpd": 1000, "tpm": 6000, "tpd": 100000, "context": 131072},
@@ -150,22 +150,79 @@ class PackConsistencyTest(unittest.TestCase):
 
 
 class DecideTest(unittest.TestCase):
-    def test_only_definite_negatives_reject(self):
-        base = {"discipline": "appsec", "seniority_fit": "good", "comp_fit": "likely_above"}
-        self.assertEqual(decide(base), "send")
-        self.assertEqual(decide({**base, "seniority_fit": "unclear", "comp_fit": "unclear"}), "send")
-        self.assertEqual(decide({**base, "discipline": "other"}), "reject")
-        self.assertEqual(decide({**base, "seniority_fit": "role_too_senior"}), "reject")
-        self.assertEqual(decide({**base, "seniority_fit": "role_too_junior", "yoe_required": 0}), "reject")
-        self.assertEqual(decide({**base, "seniority_fit": "role_too_senior", "yoe_required": 8}), "reject")
-        self.assertEqual(decide({**base, "comp_fit": "likely_below"}), "reject")
-        self.assertEqual(decide({**base, "discipline": "soc"}), "reject")
+    base = {"role_type": "appsec", "offensive_work": "significant", "seniority_fit": "good",
+            "comp_fit": "likely_above"}
 
+    def test_offensive_fit_required(self):
+        d = lambda **kw: decide({**self.base, **kw})
+        self.assertEqual(d(), "send")
+        self.assertEqual(d(role_type="pentest", offensive_work="core"), "send")
+        self.assertEqual(d(offensive_work="minor"), "reject")       # "light pentests"
+        self.assertEqual(d(offensive_work="none"), "reject")
+        # posting unavailable: only an offensive role type gets the benefit of the doubt
+        self.assertEqual(d(role_type="redteam", offensive_work="unclear"), "send")
+        self.assertEqual(d(role_type="appsec", offensive_work="unclear"), "reject")
+
+    def test_excluded_role_types_never_send(self):
+        # 2026-10-24 feedback: tooling, detection/IR/hunting, intel, infra, vuln mgmt, GRC, AI research
+        for role in ("tooling", "detection_response", "threat_intel", "infra_cloud",
+                     "vuln_management", "grc", "ai_research", "other"):
+            self.assertEqual(decide({**self.base, "role_type": role, "offensive_work": "significant"}),
+                             "reject", role)
+
+    def test_seniority_and_pay_reject_only_on_definite_negatives(self):
+        d = lambda **kw: decide({**self.base, **kw})
+        self.assertEqual(d(seniority_fit="unclear", comp_fit="unclear"), "send")
+        self.assertEqual(d(seniority_fit="role_too_senior"), "reject")
+        self.assertEqual(d(seniority_fit="role_too_junior", yoe_required=0), "reject")
+        self.assertEqual(d(seniority_fit="role_too_senior", yoe_required=8), "reject")
+        self.assertEqual(d(comp_fit="likely_below"), "reject")
 
     def test_seniority_label_contradicting_yoe_is_ignored(self):
-        v = {"discipline": "appsec", "seniority_fit": "too_junior", "yoe_required": 5,
-             "comp_fit": "likely_above"}                 # real reply for a "5+ years" posting
-        self.assertEqual(decide(v), "send")
+        # real reply for a "5+ years" posting
+        self.assertEqual(decide({**self.base, "seniority_fit": "too_junior", "yoe_required": 5}), "send")
+
+
+class BadOutputTest(unittest.TestCase):
+    def test_json_validate_failed_is_not_a_run_stop(self):
+        p = FakeProvider(queue=[Resp(400), Resp(content='{"a": 1}')])
+        p.queue[0].text = '{"error":{"code":"json_validate_failed"}}'
+        c, _, usage = make_client(p)
+        with self.assertRaises(LLMBadOutput):
+            c.chat("s", "u", 10)
+        self.assertIsNone(c.stopped)
+        self.assertEqual(len(usage), 1)                   # tokens counted even though it failed
+        self.assertEqual(c.chat("s", "u", 10), {"a": 1})
+
+    def test_reply_cut_off_is_bad_output(self):
+        r = Resp(content='{"results": [')
+        r.json = lambda: {"choices": [{"message": {"content": '{"results": ['}, "finish_reason": "length"}],
+                          "usage": {"total_tokens": 50}}
+        c, _, _ = make_client(FakeProvider(queue=[r]))
+        with self.assertRaises(LLMBadOutput):
+            c.chat("s", "u", 10)
+
+    def test_judge_splits_batch_until_replies_work(self):
+        """A 4-job batch whose reply is invalid is retried as 2 + 2; one job that keeps failing
+        is left unjudged, everything else is judged."""
+        calls = []
+
+        def handler(user):
+            ids = [int(l.split()[-1]) for l in user.splitlines() if l.startswith("### id")]
+            titles = [l for l in user.splitlines() if l.startswith("title:")]
+            calls.append(len(ids))
+            if len(ids) > 2 or any("poison" in t for t in titles):
+                return "not json at all"
+            return judge_handler(user)
+        p = FakeProvider(handler=handler)
+        c, _, _ = make_client(p)
+        js = jobs(4, desc="manual pentests")
+        js[3]["title"] = "poison"
+        got = {}
+        judge(c, js, {**CFG, "judge_batch_max": 4}, lambda j, v: got.__setitem__(j["job_id"], v))
+        self.assertEqual(sorted(got), ["0", "1", "2"])
+        self.assertEqual(calls[0], 4)
+        self.assertIsNone(c.stopped)
 
 
 class ExcerptTest(unittest.TestCase):
@@ -213,7 +270,8 @@ class TriageTest(unittest.TestCase):
 def judge_handler(user):
     ids = [int(l.split()[-1]) for l in user.splitlines() if l.startswith("### id")]
     return json.dumps({"results": [
-        {"id": i, "discipline": "appsec", "seniority_fit": "unclear", "comp_fit": "likely_above",
+        {"id": i, "role_type": "appsec", "offensive_work": "significant",
+         "offensive_evidence": "pentests web apps", "seniority_fit": "unclear", "comp_fit": "likely_above",
          "comp_note": "big tech", "reason": "appsec role", "confidence": 0.7, "summary": "s"}
         for i in ids]})
 

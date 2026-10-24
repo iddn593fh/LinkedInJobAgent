@@ -4,15 +4,17 @@ import re
 
 # --- fingerprint -------------------------------------------------------------
 
-def fingerprint(company, title, location):
+def fingerprint(company, title, location=None):
+    """sha256(company | normalized title). Location is deliberately ignored: the same role posted
+    in several cities is one job (one message listing the locations), and reposts that move
+    city are still caught. `location` is accepted only for call-site compatibility."""
     t = (title or "").lower()
     t = re.sub(r"\((.*?)\)", " ", t)                    # "(Remote)" tags
     t = re.sub(r"\b(i{1,3}|iv|v|vi|[1-5])\b", " ", t)   # level suffixes
     t = re.sub(r"[^a-z0-9 ]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     c = re.sub(r"[^a-z0-9]", "", (company or "").lower())
-    loc = re.sub(r"[^a-z0-9]", "", (location or "").lower()[:40])
-    return hashlib.sha256(f"{c}|{t}|{loc}".encode()).hexdigest()
+    return hashlib.sha256(f"{c}|{t}".encode()).hexdigest()
 
 
 # --- years of experience -----------------------------------------------------

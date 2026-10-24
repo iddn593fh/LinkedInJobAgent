@@ -1,44 +1,92 @@
 """The two LLM stages.
 
-A. triage: title + company + location only, many jobs per request. Leans to "maybe": it only
-   removes jobs that are clearly not the target discipline or clearly the wrong level.
+A. triage: title + company + location only, many jobs per request. Removes titles that are
+   clearly not offensive security work (or clearly the wrong level); generic security titles
+   stay "maybe" so the judge can read the duties.
 B. judge: full posting excerpt, as many jobs per request as the per-request token cap allows.
-   The model reports discipline / seniority / pay as labels; `decide` turns the labels into
-   send / reject, so "unclear" always means send no matter how the model phrases it.
+   The model reports labels - above all how much of the day-to-day work is hands-on attacking -
+   and `decide` turns them into send / reject.
+
+The candidate wants OFFENSIVE work only: penetration testing, red teaming, offensive security
+engineering, vulnerability research / exploit development, or AppSec / product security roles
+with real hands-on testing. Not wanted (2026-10-24 feedback): detection engineering, incident
+response, threat hunting, threat intel, SOC, security tooling / platform building, cloud / infra
+hardening, vulnerability management, GRC / compliance, AI/ML research.
+
+A batch whose reply is unusable (LLMBadOutput) is split in half and retried, down to single
+jobs; a single job that still fails is left for the next run.
 """
 import re
 
-from llm import LLMStop, estimate_tokens, pack
+from llm import LLMBadOutput, LLMStop, estimate_tokens, pack
 from logutil import log
 
-DISCIPLINES = ("appsec", "prodsec", "offsec", "pentest", "redteam", "vulnresearch")
+# role_type values that are offensive by definition
+OFFENSIVE_ROLES = ("pentest", "redteam", "offsec", "vulnresearch")
+# role_type values never wanted, whatever offensive_work says
+EXCLUDED_ROLES = ("tooling", "detection_response", "threat_intel", "infra_cloud",
+                  "vuln_management", "grc", "ai_research", "other")
+SEND_OFFENSIVE_WORK = ("core", "significant")
+MAX_BAD_REPLIES = 8              # per stage per run, then leave the rest for the next run
 
-TRIAGE_SYSTEM = """You screen LinkedIn job titles for one candidate. Target roles: application security, \
-product security, offensive security, penetration testing, red teaming, vulnerability research, \
-exploit development, secure code review - including generic "Security Engineer" / "Security \
-Researcher" titles that could be any of these.
+TRIAGE_SYSTEM = """You screen LinkedIn job titles for one candidate who wants OFFENSIVE security work \
+only: penetration testing, red teaming, offensive security engineering, vulnerability research, \
+exploit development, and application / product security roles that involve hands-on security \
+testing (finding and exploiting bugs, not building tooling).
 
 Answer per job:
-- "yes": title clearly names a target role.
-- "maybe": could be a target role (generic security title, unusual wording, security work inside \
-a software/research title). When in doubt, "maybe".
-- "no": clearly something else: SOC / detection & response / incident response / threat intel, \
-GRC / compliance / audit / risk, IAM, network/cloud/IT security operations, security sales or \
-solutions engineering, physical security, privacy, non-security roles; OR clearly the wrong \
-level: intern, new grad, junior, apprentice, staff, principal, distinguished, fellow, lead, \
-manager, director, head of, VP, CISO.
+- "yes": title clearly names an offensive role: pentester / penetration tester, red team, \
+offensive security, vulnerability researcher, exploit developer, security researcher (offensive), \
+application security engineer, product security engineer.
+- "maybe": a generic title that could be offensive work: "Security Engineer", "Software Security \
+Engineer", "Security Consultant", "Security Assessment", unusual wording. When in doubt, "maybe".
+- "no": clearly NOT offensive work: detection engineering, detection & response, incident response, \
+threat hunting, threat intelligence / threat investigator, SOC / security operations / analyst, \
+security tooling / platform / infrastructure / automation engineer, cloud / network / IT / \
+endpoint / data security, vulnerability management, GRC / compliance / audit / risk / RMF, IAM, \
+security architect, AI / ML scientist or research scientist, privacy, physical security, sales or \
+solutions engineering, non-security roles; OR clearly the wrong level: intern, new grad, junior, \
+apprentice, staff, principal, distinguished, fellow, lead, manager, director, head of, VP, CISO.
 
 Return JSON only: {"results": [{"id": <id>, "t": "yes"|"maybe"|"no"}, ...]} with every id."""
 
-JUDGE_SYSTEM = """You evaluate job postings for one candidate. For each job decide three things \
-from the posting text (and the title/company when the text is missing or thin).
+JUDGE_SYSTEM = """You evaluate job postings for one candidate who wants OFFENSIVE security work only. \
+For each job decide from the posting text (and the title/company when the text is missing).
 
-1. discipline: the role's actual day-to-day work. One of appsec, prodsec, offsec, pentest, \
-redteam, vulnresearch, other. "Security Engineer" can be AppSec at one company and SOC tooling \
-at another - judge by the duties. Detection & response, SOC, GRC, IAM, cloud/network/IT security \
-operations, sales engineering, physical security and privacy are "other".
+1. role_type: what the job mainly is, judged by the duties, not the title. One of:
+pentest, redteam, offsec, vulnresearch, appsec, prodsec, tooling, detection_response, \
+threat_intel, infra_cloud, vuln_management, grc, ai_research, other.
+- pentest: penetration testing of apps, networks, cloud, hardware.
+- redteam: red team operations, adversary emulation, purple teaming led from the attack side.
+- offsec: offensive security engineering (building AND using attack tooling, exploitation).
+- vulnresearch: finding and exploiting vulnerabilities in software/hardware, exploit development, \
+reverse engineering for bugs.
+- appsec / prodsec: securing an organisation's applications or products.
+- tooling: building security tools, platforms, scanners, SAST/DAST/SCA pipelines, guardrails, \
+security infrastructure (KMS, auth), automation.
+- detection_response: detection engineering, incident response, threat hunting, SOC.
+- threat_intel: threat intelligence, threat investigations, malware tracking.
+- infra_cloud: cloud / network / infrastructure / endpoint / corporate security hardening.
+- vuln_management: scanning, patch tracking, vulnerability metrics and remediation programs.
+- grc: governance, risk, compliance, audit, RMF, FedRAMP.
+- ai_research: AI/ML research, model safety, benchmarks and evaluations, ML for security.
 
-2. seniority_fit: is the ROLE's level right for the candidate, who has 2-5 years of experience and \
+2. offensive_work: how much of the day-to-day job is hands-on attacking - finding and exploiting \
+weaknesses. One of:
+- "core": attacking IS the job (pentests, red team engagements, vuln research / exploit dev).
+- "significant": a substantial, explicitly stated part of the duties is hands-on testing: manual \
+penetration testing of apps / APIs / mobile / cloud, security assessments or code reviews where the \
+engineer hunts and exploits bugs, bug bounty triage and reproduction. Threat modeling or design \
+reviews alone do NOT count.
+- "minor": testing is mentioned only in passing ("light pentests", "occasionally"); the job is \
+mainly something else.
+- "none": no hands-on attacking (tooling, detection, IR, infra, compliance, research...).
+- "unclear": only when the posting text is unavailable.
+AI red teaming counts as core / significant only when it is hands-on adversarial testing of systems \
+or models (developing attacks, exploitation); evaluation design, benchmarks or safety research do not.
+offensive_evidence: max 15 words naming the duties that justify offensive_work.
+
+3. seniority_fit: is the ROLE's level right for the candidate, who has 2-5 years of experience and \
 wants mid to senior level?
 - "good": the role asks for roughly 2-5 years (a stated minimum of 2, 3, 4 or 5 counts), or is mid/senior.
 - "role_too_junior": the role is BELOW the candidate: intern, new grad, entry level, 0-1 years.
@@ -48,37 +96,38 @@ manager/director scope ("define org-wide strategy", "lead a team of").
 If the posting lists several bars, the lowest minimum is the one that applies. yoe_required is that \
 lowest minimum number of years, or null if none is stated.
 
-3. comp_fit: would THIS company pay more than $250k total annual compensation (base + bonus + \
-equity) for a mid-to-senior security engineer with 2-5 years of experience, at this level? Use \
-what you know about the company's pay. A posted range is base salary only: at big tech, trading \
-firms and well-funded startups, total comp is often 1.3-2x base, so a posted base under $250k is NOT \
-by itself a reason for "likely_below". Answer "likely_below" only when you know this company's total \
-comp at this level is below $250k (e.g. most consultancies, government contractors, non-tech \
-enterprises), "likely_above" when you know it is above, otherwise "unclear". Never invent salary or \
-equity figures; comp_note says what your judgment rests on.
+4. comp_fit: would THIS company pay more than $250k total annual compensation (base + bonus + \
+equity) for a mid-to-senior security engineer with 2-5 years of experience? Use what you know about \
+the company's pay. A posted range is base salary only: at big tech, trading firms and well-funded \
+startups total comp is often 1.3-2x base, so a posted base under $250k is NOT by itself a reason \
+for "likely_below". "likely_below" only when you know this company's total comp at this level is \
+below $250k (most consultancies, government contractors, non-tech enterprises); "likely_above" \
+when you know it is above; otherwise "unclear". Staffing / recruiting firms hide the employer: \
+"unclear". Never invent salary or equity figures; comp_note says what your judgment rests on.
 
-"unclear" is always an allowed answer: a false positive costs the candidate ten seconds, a false \
-negative costs an opportunity.
-
+reason: one clause, max 12 words, stating why the job should or should not be sent.
 summary: 2-3 sentences on what the role does day to day, plus anything notable (clearance, \
 on-site days, unusual stack). Plain text.
 
 Return JSON only:
-{"results": [{"id": <id>, "discipline": "...", "seniority_fit": "...", "yoe_required": <int or null>, \
-"comp_fit": "...", "comp_note": "<max 15 words>", "reason": "<one clause, max 12 words>", \
-"confidence": <0.0-1.0>, "summary": "..."}, ...]} with every id."""
+{"results": [{"id": <id>, "role_type": "...", "offensive_work": "...", "offensive_evidence": "...", \
+"seniority_fit": "...", "yoe_required": <int or null>, "comp_fit": "...", "comp_note": "<max 15 words>", \
+"reason": "...", "confidence": <0.0-1.0>, "summary": "..."}, ...]} with every id."""
 
 TRIAGE_HEADER = "id | title | company | location\n"
 TRIAGE_OUT_PER_JOB = 14
-JUDGE_OUT_PER_JOB = 190
+JUDGE_OUT_PER_JOB = 240
 EXCERPT_KEYWORDS = re.compile(
     r"year|experience|qualif|require|salary|compensation|pay range|base pay|\$|equity|bonus|"
-    r"clearance|on-?site|hybrid|remote|level|senior|staff|principal|lead", re.I)
+    r"clearance|on-?site|hybrid|remote|level|senior|staff|principal|lead|"
+    r"pen(etration)?[ -]?test|red[ -]?team|offensive|exploit|vulnerab|attack|adversar|assess|"
+    r"review|reverse|fuzz|bug|tool|automat|detect|incident|hunt|monitor|complian|build", re.I)
 
 
 def excerpt(description, limit):
     """Fit a description into `limit` chars, keeping the opening (what the role is) and every
-    line that mentions experience, pay, level, clearance or location."""
+    line that mentions experience, pay, level, clearance, location, or the kind of work
+    (testing / exploiting vs building / detecting / compliance)."""
     text = (description or "").strip()
     if len(text) <= limit:
         return text
@@ -109,12 +158,18 @@ CANDIDATE_YOE = (2, 5)
 
 
 def decide(v):
-    """Labels -> verdict. Only a definite negative on any axis rejects.
+    """Labels -> verdict.
 
-    A seniority rejection is ignored when the model's own yoe_required sits inside the
-    candidate's band: the label is then contradicting the number (seen in practice: "5+ years"
+    Offensive fit is required: core or significant hands-on attacking, or - when the posting text
+    was unavailable - an offensive role type. Excluded role types never send. Seniority and pay
+    reject only on a definite negative ("unclear" sends). A seniority rejection is ignored when the
+    model's own yoe_required sits inside the candidate's band (seen in practice: "5+ years"
     labelled too junior, meaning the candidate rather than the role)."""
-    if v.get("discipline") not in DISCIPLINES:
+    role = v.get("role_type") or v.get("discipline")
+    work = v.get("offensive_work")
+    if role in EXCLUDED_ROLES:
+        return "reject"
+    if work not in SEND_OFFENSIVE_WORK and not (work == "unclear" and role in OFFENSIVE_ROLES):
         return "reject"
     if v.get("seniority_fit") in ("role_too_junior", "role_too_senior", "too_junior", "too_senior"):
         yoe = v.get("yoe_required")
@@ -131,6 +186,33 @@ def _results(reply):
     return {str(r.get("id")): r for r in rows or [] if isinstance(r, dict)}
 
 
+def _run(stage, batches, call, handle):
+    """Send batches in order. An unusable reply splits its batch in half (retried first); a single
+    job that still fails is skipped and stays queued for the next run. LLMStop ends the stage."""
+    queue = list(batches)
+    bad = 0
+    while queue:
+        batch = queue.pop(0)
+        try:
+            reply = call(batch)
+        except LLMStop:
+            return
+        except LLMBadOutput as e:
+            bad += 1
+            if bad > MAX_BAD_REPLIES:
+                log(f"{stage}: {bad} unusable replies this run, leaving the rest for the next run")
+                return
+            if len(batch) > 1:
+                half = len(batch) // 2
+                log(f"{stage}: unusable reply for {len(batch)} jobs ({e}); retrying as "
+                    f"{half} + {len(batch) - half}")
+                queue[:0] = [batch[:half], batch[half:]]
+            else:
+                log(f"{stage}: unusable reply for a single job ({e}); it stays queued for next run")
+            continue
+        handle(batch, reply)
+
+
 def _triage_line(i, j):
     return f'{i} | {j.get("title") or "?"} | {j.get("company") or "?"} | {j.get("location") or "?"}'
 
@@ -143,22 +225,24 @@ def triage(client, jobs, cfg, on_result):
     overhead = estimate_tokens(TRIAGE_SYSTEM) + estimate_tokens(TRIAGE_HEADER) + 30 + reasoning
     batches = pack(jobs, lambda j: estimate_tokens(_triage_line(0, j)) + 2, overhead,
                    TRIAGE_OUT_PER_JOB, client.request_max, int(cfg.get("triage_batch_max", 80)))
-    done = 0
-    for batch in batches:
+    done = [0]
+
+    def call(batch):
         lines = "\n".join(_triage_line(i, j) for i, j in enumerate(batch, 1))
-        try:
-            reply = client.chat(TRIAGE_SYSTEM, TRIAGE_HEADER + lines,
-                                max_tokens=TRIAGE_OUT_PER_JOB * len(batch) + 30 + reasoning)
-        except LLMStop:
-            break
+        return client.chat(TRIAGE_SYSTEM, TRIAGE_HEADER + lines,
+                           max_tokens=TRIAGE_OUT_PER_JOB * len(batch) + 30 + reasoning)
+
+    def handle(batch, reply):
         res = _results(reply)
         if len(res) < len(batch):
             log(f"triage: reply covered {len(res)} of {len(batch)} jobs, the rest count as maybe")
         for i, j in enumerate(batch, 1):
             label = (res.get(str(i)) or {}).get("t")
             on_result(j, label if label in ("yes", "maybe", "no") else "maybe")
-            done += 1
-    return done
+            done[0] += 1
+
+    _run("triage", batches, call, handle)
+    return done[0]
 
 
 def _judge_block(i, j, desc_chars):
@@ -177,8 +261,8 @@ def _judge_block(i, j, desc_chars):
 
 
 def judge(client, jobs, cfg, on_result):
-    """Full judgment. Calls on_result(job, verdict_dict) per job. Jobs missing from a reply are
-    left unjudged (retried next run). Stops quietly on LLMStop."""
+    """Full judgment. Calls on_result(job, verdict_dict) per job. Jobs missing from a reply, or in
+    a batch that never produced a usable reply, are left unjudged (retried next run)."""
     if not jobs:
         return 0
     desc_chars = int(cfg.get("judge_desc_chars", 3500))
@@ -195,14 +279,14 @@ def judge(client, jobs, cfg, on_result):
     desc_chars = int(max(800, min(desc_chars, room * 3, per_job * 3)))
     batches = pack(jobs, lambda j: estimate_tokens(_judge_block(0, j, desc_chars)), overhead,
                    JUDGE_OUT_PER_JOB, client.request_max, int(cfg.get("judge_batch_max", 10)))
-    done = 0
-    for batch in batches:
+    done = [0]
+
+    def call(batch):
         body = "\n".join(_judge_block(i, j, desc_chars) for i, j in enumerate(batch, 1))
-        try:
-            reply = client.chat(JUDGE_SYSTEM, body,
-                                max_tokens=JUDGE_OUT_PER_JOB * len(batch) + 60 + reasoning)
-        except LLMStop:
-            break
+        return client.chat(JUDGE_SYSTEM, body,
+                           max_tokens=JUDGE_OUT_PER_JOB * len(batch) + 60 + reasoning)
+
+    def handle(batch, reply):
         res = _results(reply)
         if len(res) < len(batch):
             log(f"judge: reply covered {len(res)} of {len(batch)} jobs, the rest retry next run")
@@ -214,5 +298,7 @@ def judge(client, jobs, cfg, on_result):
             v["verdict"] = decide(v)
             v["judged_on"] = "posting" if j.get("description") else "title only"
             on_result(j, v)
-            done += 1
-    return done
+            done[0] += 1
+
+    _run("judge", batches, call, handle)
+    return done[0]

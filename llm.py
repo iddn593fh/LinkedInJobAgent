@@ -30,6 +30,11 @@ class LLMStop(Exception):
     """No more LLM calls this run (daily budget, quota, or repeated errors)."""
 
 
+class LLMBadOutput(Exception):
+    """This request produced no usable JSON (provider json_validate_failed, a reply cut off at
+    max_tokens, or unparseable text). Only this batch failed; callers retry or split it."""
+
+
 def load_config(path=None):
     with open(path or os.environ.get("JOBAGENT_LLM_CONFIG", CONFIG_PATH)) as f:
         cfg = yaml.safe_load(f) or {}
@@ -110,6 +115,15 @@ class LLMClient:
                 return
             self.sleep(max(0.5, 60 - (t - self.window[0][0]) + 0.5))
 
+    def _count(self, used):
+        """Record one request's tokens: per-minute window, this run, today, and the DB."""
+        self.window.append((self.clock(), used))
+        self.requests += 1
+        self.tokens += used
+        self.req_today += 1
+        self.tok_today += used
+        self.record_usage(1, used)
+
     # -- call ------------------------------------------------------------------
     def chat(self, system, user, max_tokens):
         """One completion, JSON mode. Returns parsed JSON. Raises LLMStop when the day's budget
@@ -149,24 +163,33 @@ class LLMClient:
             if r.status_code >= 500 and attempt < 3:
                 self.sleep(15)
                 continue
+            if r.status_code == 400 and "json_validate_failed" in r.text:
+                # The model's reply was not valid JSON (2026-10-23/24: this stopped all judging).
+                # Tokens were still spent, so count the estimate against today's budget.
+                self._count(est)
+                log("llm: reply was not valid JSON (json_validate_failed)")
+                raise LLMBadOutput("json_validate_failed")
             if r.status_code != 200:
                 self.stopped = f"LLM HTTP {r.status_code}: {r.text[:200]}"
                 log(f"llm: ERROR {self.stopped}")
                 raise LLMStop(self.stopped)
             data = r.json()
             used = (data.get("usage") or {}).get("total_tokens") or est
-            self.window.append((self.clock(), used))
-            self.requests += 1
-            self.tokens += used
-            self.req_today += 1
-            self.tok_today += used
-            self.record_usage(1, used)
+            self._count(used)
             log(f"llm #{self.requests}: {used:,} tokens (today {self.req_today} requests, "
                 f"{self.tok_today:,}/{self.tpd:,} tokens)")
             remaining = r.headers.get("x-ratelimit-remaining-requests")
             if remaining is not None and remaining.isdigit() and int(remaining) == 0:
                 self.req_today = self.rpd          # provider says the day is spent
-            return parse_json(data["choices"][0]["message"]["content"])
+            choice = data["choices"][0]
+            if choice.get("finish_reason") == "length":
+                log("llm: reply cut off at max_tokens")
+                raise LLMBadOutput("reply cut off at max_tokens")
+            try:
+                return parse_json(choice["message"]["content"])
+            except (ValueError, TypeError) as e:
+                log(f"llm: reply was not parseable JSON ({type(e).__name__})")
+                raise LLMBadOutput("unparseable reply") from e
         self.stopped = "LLM rate limited repeatedly"
         raise LLMStop(self.stopped)
 
